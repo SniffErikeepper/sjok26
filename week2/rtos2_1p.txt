@@ -1,0 +1,199 @@
+#include <zephyr/kernel.h>
+#include <zephyr/sys/printk.h>
+#include <zephyr/device.h>
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/console/console.h>
+
+static const struct gpio_dt_spec red = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
+static const struct gpio_dt_spec green = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
+static const struct gpio_dt_spec blue = GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios);
+
+// FIFO-puskuri jopa 50 merkille (char)
+K_MSGQ_DEFINE(sequence_fifo, sizeof(char), 50, 1);
+
+// Mutex ja Ehtomuuttujat (Condition Variables)
+K_MUTEX_DEFINE(led_mutex);
+K_CONDVAR_DEFINE(cond_red);
+K_CONDVAR_DEFINE(cond_yellow);
+K_CONDVAR_DEFINE(cond_green);
+K_CONDVAR_DEFINE(cond_release);
+
+// Predikaatit ehtomuuttujille (estetään spurious wakeups)
+bool red_req = false;
+bool yellow_req = false;
+bool green_req = false;
+bool led_released = false;
+
+#define STACKSIZE 500
+#define PRIORITY 5
+
+// Thread declarations
+void red_led_task(void *, void *, void*);
+void green_led_task(void *, void *, void*);
+void yellow_led_task(void *, void *, void*);
+void dispatcher_task(void *, void *, void*);
+
+K_THREAD_DEFINE(red_thread, STACKSIZE, red_led_task, NULL, NULL, NULL, PRIORITY, 0, 0);
+K_THREAD_DEFINE(green_thread, STACKSIZE, green_led_task, NULL, NULL, NULL, PRIORITY, 0, 0);
+K_THREAD_DEFINE(yellow_thread, STACKSIZE, yellow_led_task, NULL, NULL, NULL, PRIORITY, 0, 0);
+K_THREAD_DEFINE(dispatcher_thread, STACKSIZE, dispatcher_task, NULL, NULL, NULL, PRIORITY, 0, 0);
+
+int init_led();
+
+// Main program: Toimii tässä sarjaportin kuuntelijana ja syöttää FIFOa
+int main(void)
+{
+    init_led();
+    console_init();
+
+    printk("System ready. Enter sequence (R, Y, G):\n");
+
+    while (true) {
+        // Luetaan yksittäinen kirjain sarjaportista
+        int c = console_getchar();
+        if (c > 0) {
+            char color = (char)c;
+            // Hyväksytään vain sallitut merkit
+            if (color == 'R' || color == 'Y' || color == 'G' || 
+                color == 'r' || color == 'y' || color == 'g') {
+                
+                // Laitetaan merkki FIFO-puskuriin
+                if (k_msgq_put(&sequence_fifo, &color, K_NO_WAIT) != 0) {
+                    printk("FIFO full!\n");
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+// Dispatcher-taski: Lukee FIFOa ja ohjaa valotaskejä
+void dispatcher_task(void *, void *, void*) {
+    char color;
+    printk("Dispatcher thread started\n");
+    
+    while (true) {
+        // Odotetaan kirjainta FIFO-puskurista (K_FOREVER = odottaa kunnes saa)
+        if (k_msgq_get(&sequence_fifo, &color, K_FOREVER) == 0) {
+            
+            k_mutex_lock(&led_mutex, K_FOREVER);
+            
+            // 1. Lähetetään signaali oikealle valotaskille
+            if (color == 'R' || color == 'r') {
+                red_req = true;
+                k_condvar_signal(&cond_red);
+            } else if (color == 'Y' || color == 'y') {
+                yellow_req = true;
+                k_condvar_signal(&cond_yellow);
+            } else if (color == 'G' || color == 'g') {
+                green_req = true;
+                k_condvar_signal(&cond_green);
+            }
+
+            // 2. Odotetaan release-signaalia valotaskilta, ennen kuin siirrytään seuraavaan
+            while (!led_released) {
+                k_condvar_wait(&cond_release, &led_mutex, K_FOREVER);
+            }
+            led_released = false; // Kuitataan release luetuksi
+            
+            k_mutex_unlock(&led_mutex);
+        }
+    }
+}
+
+// Initialize leds
+int init_led() {
+    int ret;
+    ret = gpio_pin_configure_dt(&red, GPIO_OUTPUT_ACTIVE);
+    if (ret < 0) return ret;
+    gpio_pin_set_dt(&red, 0);
+
+    ret = gpio_pin_configure_dt(&green, GPIO_OUTPUT_ACTIVE);
+    if (ret < 0) return ret;
+    gpio_pin_set_dt(&green, 0);
+
+    ret = gpio_pin_configure_dt(&blue, GPIO_OUTPUT_ACTIVE);
+    if (ret < 0) return ret;
+    gpio_pin_set_dt(&blue, 0);
+
+    printk("Leds initialized ok\n");
+    return 0;
+}
+
+// Task to handle red led
+void red_led_task(void *, void *, void*) {
+    printk("Red led thread started\n");
+    while (true) {
+        // Odotetaan omaa vuoroa ehtomuuttujan avulla
+        k_mutex_lock(&led_mutex, K_FOREVER);
+        while (!red_req) {
+            k_condvar_wait(&cond_red, &led_mutex, K_FOREVER);
+        }
+        red_req = false; // Nollataan pyyntö
+        k_mutex_unlock(&led_mutex);
+
+        // Suoritetaan valon näyttäminen
+        gpio_pin_set_dt(&red, 1);
+        printk("Red on\n");
+        k_sleep(K_SECONDS(1));
+        gpio_pin_set_dt(&red, 0);
+        printk("Red off\n");
+
+        // Lähetetään release-signaali dispatcherille
+        k_mutex_lock(&led_mutex, K_FOREVER);
+        led_released = true;
+        k_condvar_signal(&cond_release);
+        k_mutex_unlock(&led_mutex);
+    }
+}
+
+// Task to handle yellow led
+void yellow_led_task(void *, void *, void*) {
+    printk("Yellow led thread started\n");
+    while (true) {
+        k_mutex_lock(&led_mutex, K_FOREVER);
+        while (!yellow_req) {
+            k_condvar_wait(&cond_yellow, &led_mutex, K_FOREVER);
+        }
+        yellow_req = false;
+        k_mutex_unlock(&led_mutex);
+
+        // Keltainen tehdään polttamalla punaista ja vihreää yhdessä
+        gpio_pin_set_dt(&red, 1);
+        gpio_pin_set_dt(&green, 1);
+        printk("Yellow on\n");
+        k_sleep(K_SECONDS(1));
+        gpio_pin_set_dt(&red, 0);
+        gpio_pin_set_dt(&green, 0);
+        printk("Yellow off\n");
+
+        k_mutex_lock(&led_mutex, K_FOREVER);
+        led_released = true;
+        k_condvar_signal(&cond_release);
+        k_mutex_unlock(&led_mutex);
+    }
+}
+
+// Task to handle green led
+void green_led_task(void *, void *, void*) {
+    printk("Green led thread started\n");
+    while (true) {
+        k_mutex_lock(&led_mutex, K_FOREVER);
+        while (!green_req) {
+            k_condvar_wait(&cond_green, &led_mutex, K_FOREVER);
+        }
+        green_req = false;
+        k_mutex_unlock(&led_mutex);
+
+        gpio_pin_set_dt(&green, 1);
+        printk("Green on\n");
+        k_sleep(K_SECONDS(1));
+        gpio_pin_set_dt(&green, 0);
+        printk("Green off\n");
+
+        k_mutex_lock(&led_mutex, K_FOREVER);
+        led_released = true;
+        k_condvar_signal(&cond_release);
+        k_mutex_unlock(&led_mutex);
+    }
+}
