@@ -1,0 +1,248 @@
+#include <zephyr/kernel.h>
+#include <zephyr/sys/printk.h>
+#include <zephyr/device.h>
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/console/console.h>
+#include <zephyr/timing/timing.h> // Lisätty ajoituksia varten
+
+// Määritä 1 ottaaksesi debug-viestit käyttöön ja 0 ottaaksesi ne pois.
+#define DEBUG_PRINTS 0
+
+#if DEBUG_PRINTS
+#define DEBUG_PRINT(fmt, ...) printk(fmt, ##__VA_ARGS__)
+#else
+#define DEBUG_PRINT(fmt, ...)
+#endif
+
+static const struct gpio_dt_spec red = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
+static const struct gpio_dt_spec green = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
+static const struct gpio_dt_spec blue = GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios);
+
+// FIFO-puskuri jopa 50 merkille (char)
+K_MSGQ_DEFINE(sequence_fifo, sizeof(char), 50, 1);
+
+// Mutex ja Ehtomuuttujat (Condition Variables)
+K_MUTEX_DEFINE(led_mutex);
+K_CONDVAR_DEFINE(cond_red);
+K_CONDVAR_DEFINE(cond_yellow);
+K_CONDVAR_DEFINE(cond_green);
+K_CONDVAR_DEFINE(cond_release);
+
+// Predikaatit ehtomuuttujille (estetään spurious wakeups)
+bool red_req = false;
+bool yellow_req = false;
+bool green_req = false;
+bool led_released = false;
+
+// Sekvenssin kokonaisajan kerääjä
+uint64_t sequence_total_us = 0;
+
+#define STACKSIZE 500
+#define PRIORITY 5
+
+// Thread declarations
+void red_led_task(void *, void *, void*);
+void green_led_task(void *, void *, void*);
+void yellow_led_task(void *, void *, void*);
+void dispatcher_task(void *, void *, void*);
+
+K_THREAD_DEFINE(red_thread, STACKSIZE, red_led_task, NULL, NULL, NULL, PRIORITY, 0, 0);
+K_THREAD_DEFINE(green_thread, STACKSIZE, green_led_task, NULL, NULL, NULL, PRIORITY, 0, 0);
+K_THREAD_DEFINE(yellow_thread, STACKSIZE, yellow_led_task, NULL, NULL, NULL, PRIORITY, 0, 0);
+K_THREAD_DEFINE(dispatcher_thread, STACKSIZE, dispatcher_task, NULL, NULL, NULL, PRIORITY, 0, 0);
+
+int init_led();
+
+// Main program: Toimii tässä sarjaportin kuuntelijana ja syöttää FIFOa
+int main(void)
+{
+    init_led();
+    console_init();
+
+    // Alustetaan ajoitustoiminnot
+    timing_init();
+    timing_start();
+
+    printk("System ready. Enter sequence (R, Y, G):\n");
+
+    while (true) {
+        // Luetaan yksittäinen kirjain sarjaportista
+        int c = console_getchar();
+        if (c > 0) {
+            char color = (char)c;
+            // Hyväksytään vain sallitut merkit
+            if (color == 'R' || color == 'Y' || color == 'G' || 
+                color == 'r' || color == 'y' || color == 'g') {
+                
+                // Laitetaan merkki FIFO-puskuriin
+                if (k_msgq_put(&sequence_fifo, &color, K_NO_WAIT) != 0) {
+                    printk("FIFO full!\n");
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+// Dispatcher-taski: Lukee FIFOa ja ohjaa valotaskejä
+void dispatcher_task(void *, void *, void*) {
+    char color;
+    DEBUG_PRINT("Dispatcher thread started\n");
+    
+    while (true) {
+        // Odotetaan kirjainta FIFO-puskurista (K_FOREVER = odottaa kunnes saa)
+        if (k_msgq_get(&sequence_fifo, &color, K_FOREVER) == 0) {
+            
+            k_mutex_lock(&led_mutex, K_FOREVER);
+            
+            // 1. Lähetetään signaali oikealle valotaskille
+            if (color == 'R' || color == 'r') {
+                red_req = true;
+                k_condvar_signal(&cond_red);
+            } else if (color == 'Y' || color == 'y') {
+                yellow_req = true;
+                k_condvar_signal(&cond_yellow);
+            } else if (color == 'G' || color == 'g') {
+                green_req = true;
+                k_condvar_signal(&cond_green);
+            }
+
+            // 2. Odotetaan release-signaalia valotaskilta, ennen kuin siirrytään seuraavaan
+            while (!led_released) {
+                k_condvar_wait(&cond_release, &led_mutex, K_FOREVER);
+            }
+            led_released = false; // Kuitataan release luetuksi
+            
+            k_mutex_unlock(&led_mutex);
+
+            // Tarkistetaan onko sekvenssi tullut loppuun (puskuri tyhjä)
+            if (k_msgq_num_used_get(&sequence_fifo) == 0) {
+                printk("--- Sekvenssi valmis ---\n");
+                printk("Koko sekvenssin yhteensaika: %llu us\n\n", sequence_total_us);
+                sequence_total_us = 0; // Nollataan seuraavaa syöttöä varten
+            }
+        }
+    }
+}
+
+// Initialize leds
+int init_led() {
+    int ret;
+    ret = gpio_pin_configure_dt(&red, GPIO_OUTPUT_ACTIVE);
+    if (ret < 0) return ret;
+    gpio_pin_set_dt(&red, 0);
+
+    ret = gpio_pin_configure_dt(&green, GPIO_OUTPUT_ACTIVE);
+    if (ret < 0) return ret;
+    gpio_pin_set_dt(&green, 0);
+
+    ret = gpio_pin_configure_dt(&blue, GPIO_OUTPUT_ACTIVE);
+    if (ret < 0) return ret;
+    gpio_pin_set_dt(&blue, 0);
+
+    DEBUG_PRINT("Leds initialized ok\n");
+    return 0;
+}
+
+// Task to handle red led
+void red_led_task(void *, void *, void*) {
+    DEBUG_PRINT("Red led thread started\n");
+    while (true) {
+        k_mutex_lock(&led_mutex, K_FOREVER);
+        while (!red_req) {
+            k_condvar_wait(&cond_red, &led_mutex, K_FOREVER);
+        }
+        red_req = false;
+        k_mutex_unlock(&led_mutex);
+
+        // Aloitetaan ajanotto
+        timing_t start_time = timing_counter_get();
+
+        gpio_pin_set_dt(&red, 1);
+        DEBUG_PRINT("Red on\n");
+        k_sleep(K_SECONDS(1));
+        gpio_pin_set_dt(&red, 0);
+        DEBUG_PRINT("Red off\n");
+
+        // Lopetetaan ajanotto ja lasketaan mikrosekunnit
+        timing_t end_time = timing_counter_get();
+        uint64_t total_cycles = timing_cycles_get(&start_time, &end_time);
+        uint64_t task_time_us = timing_cycles_to_ns(total_cycles) / 1000;
+        
+        printk("Red task execution time: %llu us\n", task_time_us);
+
+        k_mutex_lock(&led_mutex, K_FOREVER);
+        sequence_total_us += task_time_us; // Lisätään kokonaisaikaan
+        led_released = true;
+        k_condvar_signal(&cond_release);
+        k_mutex_unlock(&led_mutex);
+    }
+}
+
+// Task to handle yellow led
+void yellow_led_task(void *, void *, void*) {
+    DEBUG_PRINT("Yellow led thread started\n");
+    while (true) {
+        k_mutex_lock(&led_mutex, K_FOREVER);
+        while (!yellow_req) {
+            k_condvar_wait(&cond_yellow, &led_mutex, K_FOREVER);
+        }
+        yellow_req = false;
+        k_mutex_unlock(&led_mutex);
+
+        timing_t start_time = timing_counter_get();
+
+        gpio_pin_set_dt(&red, 1);
+        gpio_pin_set_dt(&green, 1);
+        DEBUG_PRINT("Yellow on\n");
+        k_sleep(K_SECONDS(1));
+        gpio_pin_set_dt(&red, 0);
+        gpio_pin_set_dt(&green, 0);
+        DEBUG_PRINT("Yellow off\n");
+
+        timing_t end_time = timing_counter_get();
+        uint64_t total_cycles = timing_cycles_get(&start_time, &end_time);
+        uint64_t task_time_us = timing_cycles_to_ns(total_cycles) / 1000;
+        
+        printk("Yellow task execution time: %llu us\n", task_time_us);
+
+        k_mutex_lock(&led_mutex, K_FOREVER);
+        sequence_total_us += task_time_us;
+        led_released = true;
+        k_condvar_signal(&cond_release);
+        k_mutex_unlock(&led_mutex);
+    }
+}
+
+// Task to handle green led
+void green_led_task(void *, void *, void*) {
+    DEBUG_PRINT("Green led thread started\n");
+    while (true) {
+        k_mutex_lock(&led_mutex, K_FOREVER);
+        while (!green_req) {
+            k_condvar_wait(&cond_green, &led_mutex, K_FOREVER);
+        }
+        green_req = false;
+        k_mutex_unlock(&led_mutex);
+
+        timing_t start_time = timing_counter_get();
+
+        gpio_pin_set_dt(&green, 1);
+        DEBUG_PRINT("Green on\n");
+        k_sleep(K_SECONDS(1));
+        gpio_pin_set_dt(&green, 0);
+        DEBUG_PRINT("Green off\n");
+
+        timing_t end_time = timing_counter_get();
+        uint64_t total_cycles = timing_cycles_get(&start_time, &end_time);
+        uint64_t task_time_us = timing_cycles_to_ns(total_cycles) / 1000;
+        
+        printk("Green task execution time: %llu us\n", task_time_us);
+
+        k_mutex_lock(&led_mutex, K_FOREVER);
+        sequence_total_us += task_time_us;
+        led_released = true;
+        k_condvar_signal(&cond_release);
+        k_mutex_unlock(&led_mutex);
+    }
+}
