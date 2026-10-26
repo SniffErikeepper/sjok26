@@ -1,0 +1,245 @@
+#include <zephyr/kernel.h>
+#include <zephyr/sys/printk.h>
+#include <zephyr/device.h>
+#include <zephyr/drivers/gpio.h>
+
+int tila = 0; // 1=punainen, 2=keltainen ylös, 3=vihreä, 4=pause, 5=keltainen alas, 6=vilkkuva keltainen
+int edellinen_tila = 1; // Tallentaa tilan, josta siirryttiin pauseen tai vilkkuvaan keltaiseen
+int suunta = 0; // 1=ylös, 2=alas
+
+// Led and button pin configurations
+static const struct gpio_dt_spec red = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
+static const struct gpio_dt_spec green = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
+static const struct gpio_dt_spec blue = GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios);
+
+// Määritetään 5 nappia
+static const struct gpio_dt_spec button1 = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
+static const struct gpio_dt_spec button2 = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
+static const struct gpio_dt_spec button3 = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios);
+static const struct gpio_dt_spec button4 = GPIO_DT_SPEC_GET(DT_ALIAS(sw3), gpios);
+static const struct gpio_dt_spec button5 = GPIO_DT_SPEC_GET(DT_ALIAS(sw4), gpios);
+
+static struct gpio_callback button1_cb_data;
+static struct gpio_callback button2_cb_data;
+static struct gpio_callback button3_cb_data;
+static struct gpio_callback button4_cb_data;
+static struct gpio_callback button5_cb_data;
+
+// Callback-funktiot painonapeille
+void button1_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
+	printk("button 1 pressed (pause)\n");
+	if (tila != 4) {
+		edellinen_tila = tila; 
+		tila = 4; // Siirrytään pause-tilaan
+	} else {
+		tila = edellinen_tila; // Palataan takaisin aiempaan väriin
+	}
+}
+
+void button2_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
+	printk("button 2 pressed (toggle red)\n");
+	gpio_pin_toggle_dt(&red);
+}
+
+void button3_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
+	printk("button 3 pressed (toggle yellow)\n");
+	gpio_pin_toggle_dt(&red);
+	gpio_pin_toggle_dt(&green);
+}
+
+void button4_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
+	printk("button 4 pressed (toggle green)\n");
+	gpio_pin_toggle_dt(&green);
+}
+
+void button5_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
+	printk("button 5 pressed (blinking yellow sequence)\n");
+	if (tila != 6) {
+		edellinen_tila = tila;
+		tila = 6; // Siirrytään vilkkuvaan keltaiseen
+	} else {
+		tila = edellinen_tila; // Palataan takaisin normisekvenssiin
+	}
+}
+
+
+// Red led thread initialization
+#define STACKSIZE 500
+#define PRIORITY 5
+void red_led_task(void *, void *, void*);
+K_THREAD_DEFINE(red_thread,STACKSIZE,red_led_task,NULL,NULL,NULL,PRIORITY,0,0);
+void green_led_task(void *, void *, void*);
+K_THREAD_DEFINE(green_thread,STACKSIZE,green_led_task,NULL,NULL,NULL,PRIORITY,0,0);
+void yellow_led_task(void *, void *, void*);
+K_THREAD_DEFINE(yellow_thread,STACKSIZE,yellow_led_task,NULL,NULL,NULL,PRIORITY,0,0);
+// void blue_led_task(void *, void *, void*);
+// K_THREAD_DEFINE(blue_thread,STACKSIZE,blue_led_task,NULL,NULL,NULL,PRIORITY,0,0);
+
+int init_led();
+
+// Main program
+int main(void)
+{
+	init_led();
+
+	tila = 1;
+	return 0;
+}
+
+// Initialize leds and buttons
+int init_led() {
+
+	// Led pin initialization
+	int ret = gpio_pin_configure_dt(&red, GPIO_OUTPUT_ACTIVE);
+	if (ret < 0) {
+		printk("Error: Led configure failed\n");		
+		return ret;
+	}
+	gpio_pin_set_dt(&red,0);
+
+	ret = gpio_pin_configure_dt(&green, GPIO_OUTPUT_ACTIVE);
+	if (ret < 0) {
+		printk("Error: Green led configure failed\n");
+		return ret;
+	}
+	gpio_pin_set_dt(&green,0);
+
+	ret = gpio_pin_configure_dt(&blue, GPIO_OUTPUT_ACTIVE);
+	if (ret < 0) {
+		printk("Error: Blue led configure failed\n");
+		return ret;
+	}
+	gpio_pin_set_dt(&blue,0);
+    
+	// Alustetaan nappi 1
+	gpio_pin_configure_dt(&button1, GPIO_INPUT);
+	gpio_pin_interrupt_configure_dt(&button1, GPIO_INT_EDGE_TO_ACTIVE);
+	gpio_init_callback(&button1_cb_data, button1_pressed, BIT(button1.pin));
+	gpio_add_callback(button1.port, &button1_cb_data);
+
+	// Alustetaan nappi 2
+	gpio_pin_configure_dt(&button2, GPIO_INPUT);
+	gpio_pin_interrupt_configure_dt(&button2, GPIO_INT_EDGE_TO_ACTIVE);
+	gpio_init_callback(&button2_cb_data, button2_pressed, BIT(button2.pin));
+	gpio_add_callback(button2.port, &button2_cb_data);
+
+	// Alustetaan nappi 3
+	gpio_pin_configure_dt(&button3, GPIO_INPUT);
+	gpio_pin_interrupt_configure_dt(&button3, GPIO_INT_EDGE_TO_ACTIVE);
+	gpio_init_callback(&button3_cb_data, button3_pressed, BIT(button3.pin));
+	gpio_add_callback(button3.port, &button3_cb_data);
+
+	// Alustetaan nappi 4
+	gpio_pin_configure_dt(&button4, GPIO_INPUT);
+	gpio_pin_interrupt_configure_dt(&button4, GPIO_INT_EDGE_TO_ACTIVE);
+	gpio_init_callback(&button4_cb_data, button4_pressed, BIT(button4.pin));
+	gpio_add_callback(button4.port, &button4_cb_data);
+
+	// Alustetaan nappi 5
+	gpio_pin_configure_dt(&button5, GPIO_INPUT);
+	gpio_pin_interrupt_configure_dt(&button5, GPIO_INT_EDGE_TO_ACTIVE);
+	gpio_init_callback(&button5_cb_data, button5_pressed, BIT(button5.pin));
+	gpio_add_callback(button5.port, &button5_cb_data);
+
+	printk("Leds and buttons initialized ok\n");
+	
+	return 0;
+}
+
+// Task to handle red led
+void red_led_task(void *, void *, void*) {
+	printk("Red led thread started\n");
+	while (true) {
+		if (tila == 1) {
+			// 1. set led on 
+			gpio_pin_set_dt(&red, 1);
+			printk("Red on\n");
+			// 2. sleep for 1 second
+			k_sleep(K_SECONDS(1));
+			// 3. set led off
+			gpio_pin_set_dt(&red, 0);
+			printk("Red off\n");
+			// 4. sleep for 1 second
+			k_sleep(K_SECONDS(1));
+			
+			// Vaihdetaan tilaa vain, jos emme ole menneet tauolle
+			if (tila == 1) tila = 2; // Next state is Yellow
+		}
+		k_yield();
+	}
+}
+
+// Task to handle yellow led
+void yellow_led_task(void *, void *, void*) {
+	printk("Yellow led thread started\n");
+	while (true) {
+		// Handle BOTH state 2 (going up), state 5 (going down) AND state 6 (blinking yellow)
+		if (tila == 2 || tila == 5 || tila == 6) {
+			int nykyinen_tila = tila; // Tallennetaan väliaikaisesti suunta
+			// 1. set led on 
+			gpio_pin_set_dt(&red, 1);
+			gpio_pin_set_dt(&green, 1);
+			printk("Yellow on\n");
+			// 2. sleep for 1 second
+			k_sleep(K_SECONDS(1));
+			// 3. set led off
+			gpio_pin_set_dt(&red, 0);
+			gpio_pin_set_dt(&green, 0);
+			printk("Yellow off\n");
+			// 4. sleep for 1 second
+			k_sleep(K_SECONDS(1));
+			
+			// Route to the correct next state, if not paused or forced to another mode
+			if (tila == nykyinen_tila) {
+				if (tila == 2) {
+					tila = 3; // After first yellow, go to Green
+				} else if (tila == 5) {
+					tila = 1; // After second yellow, go to Red
+				}
+				// Jos tila == 6, ei tehdä mitään, ohjelma jatkaa keltaisen vilkuttamista
+			}
+		}
+		k_yield();
+	}
+}
+
+// Task to handle green led
+void green_led_task(void *, void *, void*) {
+	printk("Green led thread started\n");
+	while (true) {
+		if (tila == 3) {
+			// 1. set led on 
+			gpio_pin_set_dt(&green, 1);
+			printk("Green on\n");
+			// 2. sleep for 1 second
+			k_sleep(K_SECONDS(1));
+			// 3. set led off
+			gpio_pin_set_dt(&green, 0);
+			printk("Green off\n");
+			// 4. sleep for 1 second
+			k_sleep(K_SECONDS(1));
+			
+			if (tila == 3) tila = 5; // Next state is the second Yellow
+		}
+		k_yield();
+	}
+}
+
+/*
+// Task to handle blue led
+void blue_led_task(void *, void *, void*) {
+	printk("Blue led thread started\n");
+	while (true) {
+		// 1. set led on 
+		gpio_pin_set_dt(&blue,1);
+		printk("Blue on\n");
+		// 2. sleep for 2 seconds
+		k_sleep(K_SECONDS(1));
+		// 3. set led off
+		gpio_pin_set_dt(&blue,0);
+		printk("Blue off\n");
+		// 4. sleep for 2 seconds
+		k_sleep(K_SECONDS(1));
+	}
+}
+*/
