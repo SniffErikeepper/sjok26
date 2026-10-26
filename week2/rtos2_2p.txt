@@ -1,0 +1,236 @@
+#include <zephyr/kernel.h>
+#include <zephyr/sys/printk.h>
+#include <zephyr/device.h>
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/console/console.h>
+#include <stdio.h>
+
+volatile int tila = 0; // 1=punainen, 2=keltainen, 3=vihreä, 4=pause
+volatile int edellinen_tila = 0;
+
+static const struct gpio_dt_spec red = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
+static const struct gpio_dt_spec green = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
+static const struct gpio_dt_spec blue = GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios);
+static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
+
+static struct gpio_callback button_cb_data;
+
+void button_0_handler(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+    printk("button pressed\n");
+    if (tila != 4) {
+        edellinen_tila = tila;
+        tila = 4;
+    } else {
+        tila = edellinen_tila;
+    }
+}
+
+K_MSGQ_DEFINE(sequence_fifo, 16, 10, 4);
+K_MSGQ_DEFINE(fifo_red, sizeof(uint32_t), 10, 4);
+K_MSGQ_DEFINE(fifo_yellow, sizeof(uint32_t), 10, 4);
+K_MSGQ_DEFINE(fifo_green, sizeof(uint32_t), 10, 4);
+
+K_MUTEX_DEFINE(led_mutex);
+K_CONDVAR_DEFINE(cond_release);
+
+bool led_released = false;
+
+#define STACKSIZE 500
+#define PRIORITY 5
+
+void red_led_task(void *, void *, void*);
+void green_led_task(void *, void *, void*);
+void yellow_led_task(void *, void *, void*);
+void dispatcher_task(void *, void *, void*);
+
+K_THREAD_DEFINE(red_thread, STACKSIZE, red_led_task, NULL, NULL, NULL, PRIORITY, 0, 0);
+K_THREAD_DEFINE(green_thread, STACKSIZE, green_led_task, NULL, NULL, NULL, PRIORITY, 0, 0);
+K_THREAD_DEFINE(yellow_thread, STACKSIZE, yellow_led_task, NULL, NULL, NULL, PRIORITY, 0, 0);
+K_THREAD_DEFINE(dispatcher_thread, STACKSIZE, dispatcher_task, NULL, NULL, NULL, PRIORITY, 0, 0);
+
+int init_led();
+
+// Main program
+int main(void)
+{
+    init_led();
+    console_init();
+
+    printk("System ready. Enter sequence (e.g. R,1000\\r):\n");
+    
+    char rx_buf[16];
+    int rx_ptr = 0;
+
+    while (true) {
+        int c = console_getchar();
+        if (c > 0) {
+            if (rx_ptr == 0 && (c == ',' || c == ' ' || c == '\n')) {
+                continue;
+            }
+
+            if (c == '\r' || c == '\n') {
+                if (rx_ptr > 0) {
+                    rx_buf[rx_ptr] = '\0';
+                    if (k_msgq_put(&sequence_fifo, &rx_buf, K_NO_WAIT) != 0) {
+                        printk("Sequence FIFO full!\n");
+                    }
+                    rx_ptr = 0;
+                }
+            } else if (rx_ptr < sizeof(rx_buf) - 1) {
+                rx_buf[rx_ptr++] = (char)c;
+            }
+        }
+    }
+    return 0;
+}
+
+// Dispatcher-taski
+void dispatcher_task(void *, void *, void*) {
+    char msg[16];
+    char color;
+    uint32_t duration;
+    
+    printk("Dispatcher thread started\n");
+    
+    while (true) {
+        if (k_msgq_get(&sequence_fifo, &msg, K_FOREVER) == 0) {
+            
+            if (sscanf(msg, "%c,%u", &color, &duration) == 2) {
+                k_mutex_lock(&led_mutex, K_FOREVER);
+                
+                if (color == 'R' || color == 'r') {
+                    k_msgq_put(&fifo_red, &duration, K_FOREVER);
+                } else if (color == 'Y' || color == 'y') {
+                    k_msgq_put(&fifo_yellow, &duration, K_FOREVER);
+                } else if (color == 'G' || color == 'g') {
+                    k_msgq_put(&fifo_green, &duration, K_FOREVER);
+                } else {
+                    k_mutex_unlock(&led_mutex);
+                    continue;
+                }
+
+                while (!led_released) {
+                    k_condvar_wait(&cond_release, &led_mutex, K_FOREVER);
+                }
+                led_released = false;
+                
+                k_mutex_unlock(&led_mutex);
+            } else {
+                printk("Invalid sequence format: %s\n", msg);
+            }
+        }
+    }
+}
+
+// Initialize leds and button
+int init_led() {
+    int ret;
+    ret = gpio_pin_configure_dt(&red, GPIO_OUTPUT_ACTIVE);
+    if (ret < 0) return ret;
+    gpio_pin_set_dt(&red, 0);
+
+    ret = gpio_pin_configure_dt(&green, GPIO_OUTPUT_ACTIVE);
+    if (ret < 0) return ret;
+    gpio_pin_set_dt(&green, 0);
+
+    ret = gpio_pin_configure_dt(&blue, GPIO_OUTPUT_ACTIVE);
+    if (ret < 0) return ret;
+    gpio_pin_set_dt(&blue, 0);
+
+    if (!gpio_is_ready_dt(&button)) {
+        printk("Error: button device is not ready\n");
+        return -1;
+    }
+    ret = gpio_pin_configure_dt(&button, GPIO_INPUT);
+    if (ret < 0) return ret;
+    
+    ret = gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_TO_ACTIVE);
+    if (ret < 0) return ret;
+    
+    gpio_init_callback(&button_cb_data, button_0_handler, BIT(button.pin));
+    gpio_add_callback(button.port, &button_cb_data);
+
+    printk("Leds and button initialized ok\n");
+    return 0;
+}
+
+// Task to handle red led
+void red_led_task(void *, void *, void*) {
+    uint32_t duration;
+    printk("Red led thread started\n");
+    
+    while (true) {
+        k_msgq_get(&fifo_red, &duration, K_FOREVER);
+        tila = 1; 
+
+        gpio_pin_set_dt(&red, 1);
+        printk("Red on (%u ms)\n", duration);
+        k_sleep(K_MSEC(duration));
+        gpio_pin_set_dt(&red, 0);
+        printk("Red off\n");
+
+        while (tila == 4) {
+            k_msleep(100);
+        }
+
+        k_mutex_lock(&led_mutex, K_FOREVER);
+        led_released = true;
+        k_condvar_signal(&cond_release);
+        k_mutex_unlock(&led_mutex);
+    }
+}
+
+// Task to handle yellow led
+void yellow_led_task(void *, void *, void*) {
+    uint32_t duration;
+    printk("Yellow led thread started\n");
+    
+    while (true) {
+        k_msgq_get(&fifo_yellow, &duration, K_FOREVER);
+        tila = 2; 
+
+        gpio_pin_set_dt(&red, 1);
+        gpio_pin_set_dt(&green, 1);
+        printk("Yellow on (%u ms)\n", duration);
+        k_sleep(K_MSEC(duration));
+        gpio_pin_set_dt(&red, 0);
+        gpio_pin_set_dt(&green, 0);
+        printk("Yellow off\n");
+
+        while (tila == 4) {
+            k_msleep(100);
+        }
+
+        k_mutex_lock(&led_mutex, K_FOREVER);
+        led_released = true;
+        k_condvar_signal(&cond_release);
+        k_mutex_unlock(&led_mutex);
+    }
+}
+
+// Task to handle green led
+void green_led_task(void *, void *, void*) {
+    uint32_t duration;
+    printk("Green led thread started\n");
+    
+    while (true) {
+        k_msgq_get(&fifo_green, &duration, K_FOREVER);
+        tila = 3; 
+
+        gpio_pin_set_dt(&green, 1);
+        printk("Green on (%u ms)\n", duration);
+        k_sleep(K_MSEC(duration));
+        gpio_pin_set_dt(&green, 0);
+        printk("Green off\n");
+
+        while (tila == 4) {
+            k_msleep(100);
+        }
+
+        k_mutex_lock(&led_mutex, K_FOREVER);
+        led_released = true;
+        k_condvar_signal(&cond_release);
+        k_mutex_unlock(&led_mutex);
+    }
+}
